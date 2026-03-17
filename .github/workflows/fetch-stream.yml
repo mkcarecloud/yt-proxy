@@ -10,124 +10,50 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install yt-dlp & dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y python3-pip ffmpeg
-          pip3 install --upgrade yt-dlp
-
-      - name: Extract audio stream URL
+      - name: Search YouTube
         env:
           QUERY: ${{ github.event.client_payload.query }}
           REQUEST_ID: ${{ github.event.client_payload.request_id || 'default' }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           if [ -z "$QUERY" ]; then
-            echo "Error: No query provided in dispatch payload"
+            echo "Error: No query provided"
             exit 1
           fi
 
           echo "Query: $QUERY"
           echo "Request ID: $REQUEST_ID"
 
-          write_error() {
-            local status="$1"
-            local vid="${2:-}"
+          # Search YouTube Data API v3
+          RESULT=$(curl -s \
+            "https://www.googleapis.com/youtube/v3/search?part=snippet&q=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['QUERY']))")&type=video&videoCategoryId=10&maxResults=1&key=$YOUTUBE_API_KEY")
+
+          echo "API Response: $RESULT"
+
+          VIDEO_ID=$(echo "$RESULT" | jq -r '.items[0].id.videoId')
+          TITLE=$(echo "$RESULT" | jq -r '.items[0].snippet.title')
+          THUMBNAIL=$(echo "$RESULT" | jq -r '.items[0].snippet.thumbnails.high.url')
+          CHANNEL=$(echo "$RESULT" | jq -r '.items[0].snippet.channelTitle')
+
+          if [ -z "$VIDEO_ID" ] || [ "$VIDEO_ID" = "null" ]; then
+            echo "No video found"
             jq -n \
               --arg q "$QUERY" \
               --arg rid "$REQUEST_ID" \
-              --arg vid "$vid" \
-              --arg s "$status" \
               --argjson ts "$(date +%s)" \
-              '{request_id: $rid, query: $q, video_url: $vid, status: $s, ts: $ts}' \
+              '{request_id: $rid, query: $q, status: "no_video_found", ts: $ts}' \
               > data/stream.json
-          }
-
-          # ── Step 1: Search YouTube ──────────────────────────────────────
-          echo "Searching YouTube..."
-          VIDEO_URL=$(yt-dlp \
-            --flat-playlist \
-            --print url \
-            --match-filter "duration < 2400" \
-            --extractor-args "youtube:player_client=android" \
-            "ytsearch1:$QUERY" 2>/dev/null | head -n 1)
-
-          if [ -z "$VIDEO_URL" ]; then
-            echo "No video found for query: $QUERY"
-            write_error "no_video_found"
-            exit 0
-          fi
-
-          echo "Found video: $VIDEO_URL"
-
-          # ── Step 2: Try extraction with multiple player clients ─────────
-          STREAM_URL=""
-
-          # Attempt 1: android client (most reliable for audio)
-          echo "Attempt 1: android player client..."
-          STREAM_URL=$(yt-dlp \
-            --get-url \
-            -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
-            --extractor-args "youtube:player_client=android" \
-            --no-playlist \
-            --no-warnings \
-            "$VIDEO_URL" 2>/dev/null | head -n 1)
-
-          # Attempt 2: ios client
-          if [ -z "$STREAM_URL" ]; then
-            echo "Attempt 2: ios player client..."
-            STREAM_URL=$(yt-dlp \
-              --get-url \
-              -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
-              --extractor-args "youtube:player_client=ios" \
-              --no-playlist \
-              --no-warnings \
-              "$VIDEO_URL" 2>/dev/null | head -n 1)
-          fi
-
-          # Attempt 3: tv_embedded client
-          if [ -z "$STREAM_URL" ]; then
-            echo "Attempt 3: tv_embedded player client..."
-            STREAM_URL=$(yt-dlp \
-              --get-url \
-              -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
-              --extractor-args "youtube:player_client=tv_embedded" \
-              --no-playlist \
-              --no-warnings \
-              "$VIDEO_URL" 2>/dev/null | head -n 1)
-          fi
-
-          # Attempt 4: web client, any format
-          if [ -z "$STREAM_URL" ]; then
-            echo "Attempt 4: web client, best format..."
-            STREAM_URL=$(yt-dlp \
-              --get-url \
-              -f "best" \
-              --extractor-args "youtube:player_client=web" \
-              --no-playlist \
-              --no-warnings \
-              "$VIDEO_URL" 2>/dev/null | head -n 1)
-          fi
-
-          # ── Step 3: Write result ────────────────────────────────────────
-          if [ -z "$STREAM_URL" ]; then
-            echo "All extraction attempts failed"
-            write_error "extraction_failed" "$VIDEO_URL"
           else
-            echo "Stream URL extracted successfully"
-            TITLE=$(yt-dlp \
-              --get-title \
-              --extractor-args "youtube:player_client=android" \
-              --no-warnings \
-              "$VIDEO_URL" 2>/dev/null || echo "Unknown")
-
+            echo "Found: $TITLE ($VIDEO_ID)"
             jq -n \
               --arg q "$QUERY" \
-              --arg vid "$VIDEO_URL" \
-              --arg url "$STREAM_URL" \
+              --arg vid "$VIDEO_ID" \
               --arg tit "$TITLE" \
+              --arg thumb "$THUMBNAIL" \
+              --arg channel "$CHANNEL" \
               --arg rid "$REQUEST_ID" \
               --argjson ts "$(date +%s)" \
-              '{request_id: $rid, query: $q, video_url: $vid, stream_url: $url, title: $tit, status: "ok", ts: $ts}' \
+              '{request_id: $rid, query: $q, video_id: $vid, title: $tit, thumbnail: $thumb, channel: $channel, status: "ok", ts: $ts}' \
               > data/stream.json
           fi
 
@@ -136,7 +62,7 @@ jobs:
           git config user.name "yt-proxy-bot"
           git config user.email "bot@github.com"
           git add data/stream.json
-          git diff --staged --quiet || git commit -m "stream: ${{ github.event.client_payload.query || 'query' }} (yt-dlp)"
+          git diff --staged --quiet || git commit -m "stream: ${{ github.event.client_payload.query || 'query' }}"
           git push
 
       - name: Debug - show final json
