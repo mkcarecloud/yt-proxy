@@ -1,4 +1,4 @@
-name: Fetch YouTube Stream URL
+name: Fetch YouTube Audio Stream URL with yt-dlp
 
 on:
   repository_dispatch:
@@ -7,113 +7,83 @@ on:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Fetch stream URL from Invidious
-        id: fetch
+      - name: Install yt-dlp & dependencies
         run: |
-          VIDEO_ID="${{ github.event.client_payload.video_id }}"
-          REQUEST_ID="${{ github.event.client_payload.request_id }}"
-          echo "Fetching stream for video_id=$VIDEO_ID request_id=$REQUEST_ID"
+          sudo apt-get update
+          sudo apt-get install -y python3-pip ffmpeg
+          pip3 install --upgrade yt-dlp
 
-          INSTANCES=(
-            "https://invidious.nerdvpn.de"
-            "https://invidious.privacyredirect.com"
-            "https://invidious.lunar.icu"
-            "https://inv.tux.pizza"
-            "https://invidious.fdn.fr"
-            "https://iv.ggtyler.dev"
-            "https://invidious.perennialte.ch"
-            "https://yt.cdaut.de"
-          )
+      - name: Extract audio stream URL
+        env:
+          QUERY: ${{ github.event.client_payload.query }}
+          REQUEST_ID: ${{ github.event.client_payload.request_id || 'default' }}
 
-          STREAM_URL=""
-          STREAM_TYPE=""
-          PROXY_USED=""
-
-          for BASE in "${INSTANCES[@]}"; do
-            echo "Trying $BASE ..."
-            RESPONSE=$(curl -sf --max-time 10 \
-              -H "Accept: application/json" \
-              "$BASE/api/v1/videos/$VIDEO_ID?local=true" 2>/dev/null) || continue
-
-            # Extract best audio-only stream URL using python
-            RESULT=$(python3 -c "
-          import json, sys
-          try:
-            data = json.loads('''$RESPONSE''')
-            # Try adaptiveFormats (audio-only)
-            audio = [f for f in data.get('adaptiveFormats', [])
-                     if f.get('type','').startswith('audio/') and f.get('url')]
-            audio.sort(key=lambda f: f.get('bitrate', 0), reverse=True)
-            if audio:
-              f = audio[0]
-              print(json.dumps({'url': f['url'], 'type': f.get('type',''), 'bitrate': f.get('bitrate',0)}))
-              sys.exit(0)
-            # Fallback: formatStreams (combined)
-            combined = [f for f in data.get('formatStreams', []) if f.get('url')]
-            if combined:
-              f = combined[0]
-              print(json.dumps({'url': f['url'], 'type': f.get('type',''), 'bitrate': 0}))
-              sys.exit(0)
-            print('{}')
-          except Exception as e:
-            print('{}')
-          " 2>/dev/null)
-
-            URL=$(echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
-            TYPE=$(echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('type',''))" 2>/dev/null)
-
-            if [ -n "$URL" ]; then
-              STREAM_URL="$URL"
-              STREAM_TYPE="$TYPE"
-              PROXY_USED="$BASE"
-              echo "✅ Got stream from $BASE"
-              break
-            fi
-          done
-
-          # Write result JSON
-          if [ -n "$STREAM_URL" ]; then
-            python3 -c "
-          import json
-          data = {
-            'request_id': '$REQUEST_ID',
-            'video_id': '$VIDEO_ID',
-            'url': '$STREAM_URL',
-            'type': '$STREAM_TYPE',
-            'proxy': '$PROXY_USED',
-            'status': 'ok',
-            'ts': $(date +%s)
-          }
-          with open('data/stream.json', 'w') as f:
-            json.dump(data, f)
-          print('Written stream.json')
-          "
-          else
-            python3 -c "
-          import json
-          data = {
-            'request_id': '$REQUEST_ID',
-            'video_id': '$VIDEO_ID',
-            'status': 'error',
-            'error': 'All Invidious instances failed',
-            'ts': $(date +%s)
-          }
-          with open('data/stream.json', 'w') as f:
-            json.dump(data, f)
-          print('Written error stream.json')
-          "
+        run: |
+          if [ -z "$QUERY" ]; then
+            echo "Error: No query provided in dispatch payload"
+            exit 1
           fi
 
-      - name: Commit and push result
+          echo "Query: $QUERY"
+          echo "Request ID: $REQUEST_ID"
+
+          # Step 1: Search YouTube → get best matching video URL
+          # yt-dlp can search directly and give the first result's URL
+          VIDEO_URL=$(yt-dlp --flat-playlist --print url --match-filter "duration < 2400" "ytsearch1:$QUERY" 2>/dev/null | head -n 1)
+
+          if [ -z "$VIDEO_URL" ]; then
+            echo "No video found for query: $QUERY"
+            jq -n --arg q "$QUERY" --arg rid "$REQUEST_ID" --argjson ts "$(date +%s)" \
+              '{request_id: $rid, query: $q, status: "no_video_found", ts: $ts}' > data/stream.json
+            exit 0
+          fi
+
+          echo "Found video: $VIDEO_URL"
+
+          # Step 2: Get best audio-only direct URL (m4a / opus / webm audio)
+          # Prefer format 140 (m4a ~128-256k), fallback to bestaudio
+          STREAM_URL=$(yt-dlp \
+            --get-url \
+            -f "140/bestaudio/best[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
+            --no-playlist \
+            --no-download-archive \
+            --no-warnings \
+            "$VIDEO_URL" 2>/dev/null | head -n 1)
+
+          if [ -z "$STREAM_URL" ]; then
+            echo "Failed to extract audio stream URL"
+            jq -n --arg q "$QUERY" --arg vid "$VIDEO_URL" --arg rid "$REQUEST_ID" --argjson ts "$(date +%s)" \
+              '{request_id: $rid, query: $q, video_url: $vid, status: "extraction_failed", ts: $ts}' > data/stream.json
+          else
+            echo "Stream URL extracted: $STREAM_URL"
+
+            # Optional: Get title & other info
+            TITLE=$(yt-dlp --get-title "$VIDEO_URL" 2>/dev/null || echo "Unknown")
+
+            jq -n \
+              --arg q "$QUERY" \
+              --arg vid "$VIDEO_URL" \
+              --arg url "$STREAM_URL" \
+              --arg tit "$TITLE" \
+              --arg rid "$REQUEST_ID" \
+              --argjson ts "$(date +%s)" \
+              '{request_id: $rid, query: $q, video_url: $vid, stream_url: $url, title: $tit, status: "ok", ts: $ts}' \
+              > data/stream.json
+          fi
+
+      - name: Commit result to repo
         run: |
           git config user.name "yt-proxy-bot"
           git config user.email "bot@github.com"
           git add data/stream.json
-          git diff --staged --quiet || git commit -m "stream: ${{ github.event.client_payload.video_id }}"
+          git diff --staged --quiet || git commit -m "stream: ${{ github.event.client_payload.query || 'query' }} (yt-dlp)"
           git push
+
+      - name: Debug - show final json
+        run: cat data/stream.json || echo "No stream.json written"
