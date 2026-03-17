@@ -1,21 +1,18 @@
 name: Fetch YouTube Audio Stream URL with yt-dlp
-
 on:
   repository_dispatch:
     types: [fetch-stream]
-
 jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install yt-dlp & dependencies
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y python3-pip ffmpeg
           pip3 install --upgrade yt-dlp
 
@@ -23,7 +20,6 @@ jobs:
         env:
           QUERY: ${{ github.event.client_payload.query }}
           REQUEST_ID: ${{ github.event.client_payload.request_id || 'default' }}
-
         run: |
           if [ -z "$QUERY" ]; then
             echo "Error: No query provided in dispatch payload"
@@ -33,38 +29,96 @@ jobs:
           echo "Query: $QUERY"
           echo "Request ID: $REQUEST_ID"
 
-          # Step 1: Search YouTube → get best matching video URL
-          # yt-dlp can search directly and give the first result's URL
-          VIDEO_URL=$(yt-dlp --flat-playlist --print url --match-filter "duration < 2400" "ytsearch1:$QUERY" 2>/dev/null | head -n 1)
+          write_error() {
+            local status="$1"
+            local vid="${2:-}"
+            jq -n \
+              --arg q "$QUERY" \
+              --arg rid "$REQUEST_ID" \
+              --arg vid "$vid" \
+              --arg s "$status" \
+              --argjson ts "$(date +%s)" \
+              '{request_id: $rid, query: $q, video_url: $vid, status: $s, ts: $ts}' \
+              > data/stream.json
+          }
+
+          # ── Step 1: Search YouTube ──────────────────────────────────────
+          echo "Searching YouTube..."
+          VIDEO_URL=$(yt-dlp \
+            --flat-playlist \
+            --print url \
+            --match-filter "duration < 2400" \
+            --extractor-args "youtube:player_client=android" \
+            "ytsearch1:$QUERY" 2>/dev/null | head -n 1)
 
           if [ -z "$VIDEO_URL" ]; then
             echo "No video found for query: $QUERY"
-            jq -n --arg q "$QUERY" --arg rid "$REQUEST_ID" --argjson ts "$(date +%s)" \
-              '{request_id: $rid, query: $q, status: "no_video_found", ts: $ts}' > data/stream.json
+            write_error "no_video_found"
             exit 0
           fi
 
           echo "Found video: $VIDEO_URL"
 
-          # Step 2: Get best audio-only direct URL (m4a / opus / webm audio)
-          # Prefer format 140 (m4a ~128-256k), fallback to bestaudio
+          # ── Step 2: Try extraction with multiple player clients ─────────
+          STREAM_URL=""
+
+          # Attempt 1: android client (most reliable for audio)
+          echo "Attempt 1: android player client..."
           STREAM_URL=$(yt-dlp \
             --get-url \
-            -f "140/bestaudio/best[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
+            -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
+            --extractor-args "youtube:player_client=android" \
             --no-playlist \
-            --no-download-archive \
             --no-warnings \
             "$VIDEO_URL" 2>/dev/null | head -n 1)
 
+          # Attempt 2: ios client
           if [ -z "$STREAM_URL" ]; then
-            echo "Failed to extract audio stream URL"
-            jq -n --arg q "$QUERY" --arg vid "$VIDEO_URL" --arg rid "$REQUEST_ID" --argjson ts "$(date +%s)" \
-              '{request_id: $rid, query: $q, video_url: $vid, status: "extraction_failed", ts: $ts}' > data/stream.json
-          else
-            echo "Stream URL extracted: $STREAM_URL"
+            echo "Attempt 2: ios player client..."
+            STREAM_URL=$(yt-dlp \
+              --get-url \
+              -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
+              --extractor-args "youtube:player_client=ios" \
+              --no-playlist \
+              --no-warnings \
+              "$VIDEO_URL" 2>/dev/null | head -n 1)
+          fi
 
-            # Optional: Get title & other info
-            TITLE=$(yt-dlp --get-title "$VIDEO_URL" 2>/dev/null || echo "Unknown")
+          # Attempt 3: tv_embedded client
+          if [ -z "$STREAM_URL" ]; then
+            echo "Attempt 3: tv_embedded player client..."
+            STREAM_URL=$(yt-dlp \
+              --get-url \
+              -f "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio" \
+              --extractor-args "youtube:player_client=tv_embedded" \
+              --no-playlist \
+              --no-warnings \
+              "$VIDEO_URL" 2>/dev/null | head -n 1)
+          fi
+
+          # Attempt 4: web client, any format
+          if [ -z "$STREAM_URL" ]; then
+            echo "Attempt 4: web client, best format..."
+            STREAM_URL=$(yt-dlp \
+              --get-url \
+              -f "best" \
+              --extractor-args "youtube:player_client=web" \
+              --no-playlist \
+              --no-warnings \
+              "$VIDEO_URL" 2>/dev/null | head -n 1)
+          fi
+
+          # ── Step 3: Write result ────────────────────────────────────────
+          if [ -z "$STREAM_URL" ]; then
+            echo "All extraction attempts failed"
+            write_error "extraction_failed" "$VIDEO_URL"
+          else
+            echo "Stream URL extracted successfully"
+            TITLE=$(yt-dlp \
+              --get-title \
+              --extractor-args "youtube:player_client=android" \
+              --no-warnings \
+              "$VIDEO_URL" 2>/dev/null || echo "Unknown")
 
             jq -n \
               --arg q "$QUERY" \
