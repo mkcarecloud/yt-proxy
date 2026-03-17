@@ -26,20 +26,39 @@ jobs:
 
           ENCODED_QUERY=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['QUERY']))")
 
-          # Search with videoEmbeddable=true filter
+          # Get top 10 results
           RESULT=$(curl -s \
-            "https://www.googleapis.com/youtube/v3/search?part=snippet&q=${ENCODED_QUERY}&type=video&videoCategoryId=10&maxResults=5&videoEmbeddable=true&key=$YOUTUBE_API_KEY")
+            "https://www.googleapis.com/youtube/v3/search?part=snippet&q=${ENCODED_QUERY}&type=video&videoCategoryId=10&maxResults=10&videoEmbeddable=true&key=$YOUTUBE_API_KEY")
 
-          echo "API Response: $RESULT"
+          echo "Search done, checking embeddability..."
 
-          # Pick first embeddable result
-          VIDEO_ID=$(echo "$RESULT" | jq -r '.items[0].id.videoId')
-          TITLE=$(echo "$RESULT"    | jq -r '.items[0].snippet.title')
-          THUMBNAIL=$(echo "$RESULT"| jq -r '.items[0].snippet.thumbnails.high.url')
-          CHANNEL=$(echo "$RESULT"  | jq -r '.items[0].snippet.channelTitle')
+          # Extract all video IDs as comma separated
+          VIDEO_IDS=$(echo "$RESULT" | jq -r '[.items[].id.videoId] | join(",")')
+          echo "Candidate IDs: $VIDEO_IDS"
 
-          if [ -z "$VIDEO_ID" ] || [ "$VIDEO_ID" = "null" ]; then
-            echo "No embeddable video found"
+          # Check each video's actual embed status via videos endpoint
+          DETAILS=$(curl -s \
+            "https://www.googleapis.com/youtube/v3/videos?part=status,snippet&id=${VIDEO_IDS}&key=$YOUTUBE_API_KEY")
+
+          echo "Details fetched"
+
+          # Find first video where embeddable is truly true
+          SELECTED=$(echo "$DETAILS" | jq -r '
+            .items[]
+            | select(.status.embeddable == true)
+            | {
+                videoId: .id,
+                title: .snippet.title,
+                channel: .snippet.channelTitle,
+                thumbnail: .snippet.thumbnails.high.url
+              }
+            | @json
+          ' | head -n 1)
+
+          echo "Selected: $SELECTED"
+
+          if [ -z "$SELECTED" ] || [ "$SELECTED" = "null" ]; then
+            echo "No truly embeddable video found"
             jq -n \
               --arg q "$QUERY" \
               --arg rid "$REQUEST_ID" \
@@ -47,7 +66,13 @@ jobs:
               '{request_id: $rid, query: $q, status: "no_video_found", ts: $ts}' \
               > data/stream.json
           else
-            echo "Found embeddable video: $TITLE ($VIDEO_ID)"
+            VIDEO_ID=$(echo "$SELECTED" | jq -r '.videoId')
+            TITLE=$(echo "$SELECTED"    | jq -r '.title')
+            THUMBNAIL=$(echo "$SELECTED"| jq -r '.thumbnail')
+            CHANNEL=$(echo "$SELECTED"  | jq -r '.channel')
+
+            echo "Embeddable video found: $TITLE ($VIDEO_ID)"
+
             jq -n \
               --arg q "$QUERY" \
               --arg vid "$VIDEO_ID" \
