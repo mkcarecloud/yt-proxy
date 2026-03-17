@@ -103,9 +103,7 @@ jobs:
         run: |
           git config user.name "yt-proxy-bot"
           git config user.email "bot@github.com"
+          git pull --rebase origin main
           git add data/stream.json
           git diff --staged --quiet || git commit -m "stream: ${{ github.event.client_payload.query || 'query' }}"
           git push
-
-      - name: Debug - show final json
-        run: cat data/stream.json || echo "No stream.json written"
