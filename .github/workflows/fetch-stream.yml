@@ -1,4 +1,4 @@
-name: Fetch YouTube Audio Stream URL with yt-dlp
+name: Fetch YouTube Audio Stream URL
 on:
   repository_dispatch:
     types: [fetch-stream]
@@ -10,26 +10,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── ADD IT RIGHT HERE ──────────────────────────
-      - name: Inject config
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
-        run: |
-          cat > config.js << EOF
-          window.__CONFIG__ = {
-            PAT: "$GH_PAT",
-            OWNER: "mkcarecloud",
-            REPO: "yt-proxy",
-            BRANCH: "main"
-          };
-          EOF
-          git config user.name "yt-proxy-bot"
-          git config user.email "bot@github.com"
-          git add config.js
-          git diff --staged --quiet || git commit -m "update config"
-          git push
-      # ───────────────────────────────────────────────
-
       - name: Search YouTube
         env:
           QUERY: ${{ github.event.client_payload.query }}
@@ -37,8 +17,8 @@ jobs:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
         run: |
           if [ -z "$QUERY" ]; then
-            echo "Error: No query provided"
-            exit 1
+            echo "No query provided"
+            exit 0
           fi
 
           echo "Query: $QUERY"
@@ -46,17 +26,19 @@ jobs:
 
           ENCODED_QUERY=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['QUERY']))")
 
+          # Search top 10 results with embeddable filter
           RESULT=$(curl -s \
             "https://www.googleapis.com/youtube/v3/search?part=snippet&q=${ENCODED_QUERY}&type=video&videoCategoryId=10&maxResults=10&videoEmbeddable=true&key=$YOUTUBE_API_KEY")
 
-          echo "Search done, checking embeddability..."
-
+          # Get all video IDs
           VIDEO_IDS=$(echo "$RESULT" | jq -r '[.items[].id.videoId] | join(",")')
-          echo "Candidate IDs: $VIDEO_IDS"
+          echo "Candidates: $VIDEO_IDS"
 
+          # Verify embeddable status via videos endpoint
           DETAILS=$(curl -s \
             "https://www.googleapis.com/youtube/v3/videos?part=status,snippet&id=${VIDEO_IDS}&key=$YOUTUBE_API_KEY")
 
+          # Pick first truly embeddable video
           SELECTED=$(echo "$DETAILS" | jq -r '
             .items[]
             | select(.status.embeddable == true)
@@ -69,10 +51,8 @@ jobs:
             | @json
           ' | head -n 1)
 
-          echo "Selected: $SELECTED"
-
           if [ -z "$SELECTED" ] || [ "$SELECTED" = "null" ]; then
-            echo "No truly embeddable video found"
+            echo "No embeddable video found"
             jq -n \
               --arg q "$QUERY" \
               --arg rid "$REQUEST_ID" \
@@ -85,7 +65,7 @@ jobs:
             THUMBNAIL=$(echo "$SELECTED"| jq -r '.thumbnail')
             CHANNEL=$(echo "$SELECTED"  | jq -r '.channel')
 
-            echo "Embeddable video found: $TITLE ($VIDEO_ID)"
+            echo "Found: $TITLE ($VIDEO_ID)"
 
             jq -n \
               --arg q "$QUERY" \
@@ -99,7 +79,7 @@ jobs:
               > data/stream.json
           fi
 
-      - name: Commit result to repo
+      - name: Commit result
         run: |
           git config user.name "yt-proxy-bot"
           git config user.email "bot@github.com"
@@ -107,3 +87,6 @@ jobs:
           git add data/stream.json
           git diff --staged --quiet || git commit -m "stream: ${{ github.event.client_payload.query || 'query' }}"
           git push
+
+      - name: Debug
+        run: cat data/stream.json || echo "No stream.json written"
