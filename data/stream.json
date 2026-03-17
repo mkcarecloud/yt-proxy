@@ -1,1 +1,7 @@
-{"status":"idle","request_id":"","video_id":"","url":"","ts":0}
+{
+  "request_id": "1773764991435",
+  "query": "nusrat fateh ali khan dil lagi.",
+  "video_url": "https://www.youtube.com/watch?v=q4NVp-aFZSw",
+  "status": "extraction_failed",
+  "ts": 1773765032
+}
