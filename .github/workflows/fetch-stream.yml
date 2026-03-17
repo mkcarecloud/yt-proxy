@@ -1,0 +1,119 @@
+name: Fetch YouTube Stream URL
+
+on:
+  repository_dispatch:
+    types: [fetch-stream]
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch stream URL from Invidious
+        id: fetch
+        run: |
+          VIDEO_ID="${{ github.event.client_payload.video_id }}"
+          REQUEST_ID="${{ github.event.client_payload.request_id }}"
+          echo "Fetching stream for video_id=$VIDEO_ID request_id=$REQUEST_ID"
+
+          INSTANCES=(
+            "https://invidious.nerdvpn.de"
+            "https://invidious.privacyredirect.com"
+            "https://invidious.lunar.icu"
+            "https://inv.tux.pizza"
+            "https://invidious.fdn.fr"
+            "https://iv.ggtyler.dev"
+            "https://invidious.perennialte.ch"
+            "https://yt.cdaut.de"
+          )
+
+          STREAM_URL=""
+          STREAM_TYPE=""
+          PROXY_USED=""
+
+          for BASE in "${INSTANCES[@]}"; do
+            echo "Trying $BASE ..."
+            RESPONSE=$(curl -sf --max-time 10 \
+              -H "Accept: application/json" \
+              "$BASE/api/v1/videos/$VIDEO_ID?local=true" 2>/dev/null) || continue
+
+            # Extract best audio-only stream URL using python
+            RESULT=$(python3 -c "
+          import json, sys
+          try:
+            data = json.loads('''$RESPONSE''')
+            # Try adaptiveFormats (audio-only)
+            audio = [f for f in data.get('adaptiveFormats', [])
+                     if f.get('type','').startswith('audio/') and f.get('url')]
+            audio.sort(key=lambda f: f.get('bitrate', 0), reverse=True)
+            if audio:
+              f = audio[0]
+              print(json.dumps({'url': f['url'], 'type': f.get('type',''), 'bitrate': f.get('bitrate',0)}))
+              sys.exit(0)
+            # Fallback: formatStreams (combined)
+            combined = [f for f in data.get('formatStreams', []) if f.get('url')]
+            if combined:
+              f = combined[0]
+              print(json.dumps({'url': f['url'], 'type': f.get('type',''), 'bitrate': 0}))
+              sys.exit(0)
+            print('{}')
+          except Exception as e:
+            print('{}')
+          " 2>/dev/null)
+
+            URL=$(echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('url',''))" 2>/dev/null)
+            TYPE=$(echo "$RESULT" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('type',''))" 2>/dev/null)
+
+            if [ -n "$URL" ]; then
+              STREAM_URL="$URL"
+              STREAM_TYPE="$TYPE"
+              PROXY_USED="$BASE"
+              echo "✅ Got stream from $BASE"
+              break
+            fi
+          done
+
+          # Write result JSON
+          if [ -n "$STREAM_URL" ]; then
+            python3 -c "
+          import json
+          data = {
+            'request_id': '$REQUEST_ID',
+            'video_id': '$VIDEO_ID',
+            'url': '$STREAM_URL',
+            'type': '$STREAM_TYPE',
+            'proxy': '$PROXY_USED',
+            'status': 'ok',
+            'ts': $(date +%s)
+          }
+          with open('data/stream.json', 'w') as f:
+            json.dump(data, f)
+          print('Written stream.json')
+          "
+          else
+            python3 -c "
+          import json
+          data = {
+            'request_id': '$REQUEST_ID',
+            'video_id': '$VIDEO_ID',
+            'status': 'error',
+            'error': 'All Invidious instances failed',
+            'ts': $(date +%s)
+          }
+          with open('data/stream.json', 'w') as f:
+            json.dump(data, f)
+          print('Written error stream.json')
+          "
+          fi
+
+      - name: Commit and push result
+        run: |
+          git config user.name "yt-proxy-bot"
+          git config user.email "bot@github.com"
+          git add data/stream.json
+          git diff --staged --quiet || git commit -m "stream: ${{ github.event.client_payload.video_id }}"
+          git push
