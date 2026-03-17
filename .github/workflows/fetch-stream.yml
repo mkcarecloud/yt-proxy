@@ -10,6 +10,26 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # ── ADD IT RIGHT HERE ──────────────────────────
+      - name: Inject config
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          cat > config.js << EOF
+          window.__CONFIG__ = {
+            PAT: "$GH_PAT",
+            OWNER: "mkcarecloud",
+            REPO: "yt-proxy",
+            BRANCH: "main"
+          };
+          EOF
+          git config user.name "yt-proxy-bot"
+          git config user.email "bot@github.com"
+          git add config.js
+          git diff --staged --quiet || git commit -m "update config"
+          git push
+      # ───────────────────────────────────────────────
+
       - name: Search YouTube
         env:
           QUERY: ${{ github.event.client_payload.query }}
@@ -26,23 +46,17 @@ jobs:
 
           ENCODED_QUERY=$(python3 -c "import urllib.parse,os; print(urllib.parse.quote(os.environ['QUERY']))")
 
-          # Get top 10 results
           RESULT=$(curl -s \
             "https://www.googleapis.com/youtube/v3/search?part=snippet&q=${ENCODED_QUERY}&type=video&videoCategoryId=10&maxResults=10&videoEmbeddable=true&key=$YOUTUBE_API_KEY")
 
           echo "Search done, checking embeddability..."
 
-          # Extract all video IDs as comma separated
           VIDEO_IDS=$(echo "$RESULT" | jq -r '[.items[].id.videoId] | join(",")')
           echo "Candidate IDs: $VIDEO_IDS"
 
-          # Check each video's actual embed status via videos endpoint
           DETAILS=$(curl -s \
             "https://www.googleapis.com/youtube/v3/videos?part=status,snippet&id=${VIDEO_IDS}&key=$YOUTUBE_API_KEY")
 
-          echo "Details fetched"
-
-          # Find first video where embeddable is truly true
           SELECTED=$(echo "$DETAILS" | jq -r '
             .items[]
             | select(.status.embeddable == true)
